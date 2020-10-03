@@ -440,8 +440,6 @@ class T5_VAE_Trainer(Trainer):
             logger.info(output)
 
     def save_model(self, output_dir: Optional[str] = None):
-        if self.is_world_master():  # Always save the tokenizer with the model
-            self.model.tokenizer.save_pretrained(output_dir if output_dir is not None else self.args.output_dir)
         super().save_model(output_dir)
 
     def get_train_dataloader(self) -> DataLoader:
@@ -600,7 +598,6 @@ class T5_VAE_Trainer(Trainer):
                         self.save_model(output_dir)
 
                         if self.is_world_master():
-                            self.model.tokenizer.save_pretrained(self.args.output_dir)
                             self._rotate_checkpoints()
 
                         torch.save(optimizer.state_dict(), os.path.join(output_dir, "optimizer.pt"))
@@ -835,15 +832,6 @@ def main(alt_local_rank=None):
         )
         trainer.train(model_path=model_path)
         trainer.save_model()
-        # For convenience, we also re-save the tokenizer to the same directory,
-        # so that you can share your model easily on huggingface.co/models =)
-        if trainer.is_world_master():
-            model.tokenizer.save_pretrained(training_args.output_dir)
-
-
-def _mp_fn(index):
-    # For xla_spawn (TPUs)
-    main(index)
 
 
 if __name__ == "__main__":
