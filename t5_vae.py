@@ -56,6 +56,8 @@ from transformers import (
     TrainingArguments,
     set_seed,
     torch_distributed_zero_first,
+    T5Tokenizer,
+    T5Config
 )
 from transformers.modeling_utils import PreTrainedModel
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
@@ -81,6 +83,23 @@ logger = logging.getLogger(__name__)
 
 MODEL_CONFIG_CLASSES = list(MODEL_WITH_LM_HEAD_MAPPING.keys())
 MODEL_TYPES = tuple(conf.model_type for conf in MODEL_CONFIG_CLASSES)
+
+
+class NesT5Tokenizer():
+    def __init__(self, vocab_file):
+        with open(vocab_file, 'r') as f:
+            tokens = f.read().split('\n')
+        tokens = list(filter(None, tokens))
+        tokens = [txt.strip() for txt in tokens]
+        tokens = list(set(tokens))
+        self.vocab = ['<pad>', '</s>'] + tokens
+
+    def tokenize(self, txt):
+        txt = txt.split(' ')
+        return [self.vocab.index(word.strip()) for word in txt]
+
+    def __len__(self):
+        return len(self.vocab)
 
 
 class LatentEncoderLargeTanh_1kLatent(nn.Module):
@@ -252,7 +271,7 @@ class SetSizeLineByLineTextDataset(Dataset):
         Same as `LineByLineTextDataset` by Huggingface but modified to used fixed length sequences & to cache the result.
     """
     def __init__(
-        self, tokenizer: PreTrainedTokenizer, file_path: str, set_seq_size, overwrite_cache=False, local_rank=-1
+        self, tokenizer: PreTrainedTokenizer, file_path: str, set_seq_size, overwrite_cache=False
     ):
         logger.info(f"Loading text.")
 
@@ -269,7 +288,6 @@ class SetSizeLineByLineTextDataset(Dataset):
         else:
             if not os.path.isfile(file_path):
                 raise Exception(f"Can't find true file:\n{file_path}\nAlso can't find cahced file:\n{cached_features_file}")
-            # don't create cache when running in parallel
 
             logger.info(f"Creating features from dataset file at {directory}")
 
@@ -329,6 +347,62 @@ class SetSizeLineByLineTextDataset(Dataset):
 
     def __getitem__(self, i):
         return self.examples[i]
+
+
+class NesDataset(SetSizeLineByLineTextDataset):
+    '''
+        Uses a vocab dict instead of a tokenizer since we don't want any fancy text processing.
+        Needs to have ALL sequences be of a set size.
+        Doesn't use an EOS token as we already know the sequence length and we're hoping to potentially blend larger sequences.
+    '''
+    def __init__(
+        self, tokenizer, file_path, set_seq_size, overwrite_cache=False
+    ):
+        logger.info(f"Loading text.")
+
+        directory, filename = os.path.split(file_path)
+        cached_features_file = os.path.join(directory, f"nes_seq_size_{set_seq_size}_{filename}")
+
+        if os.path.exists(cached_features_file) and not overwrite_cache:
+            start = time.time()
+            logger.info(f"Loading features from cached file {cached_features_file}...")
+            with open(cached_features_file, "rb") as handle:
+                self.examples = pickle.load(handle)
+            logger.info("[took %.3f s]", time.time() - start)
+
+        else:
+            if not os.path.isfile(file_path):
+                raise Exception(f"Can't find true file:\n{file_path}\nAlso can't find cahced file:\n{cached_features_file}")
+
+            logger.info(f"Creating features from dataset file at {directory}")
+
+            seq_texts = self._get_text_sequences(file_path)
+            random.shuffle(seq_texts)
+
+            tokenized_seqs = []
+            for text in tqdm(seq_texts, desc="Tokenizing each sequence."):
+                tokenized_seqs.append(
+                    tokenizer.tokenize(text)
+                )
+
+            assert(
+                max([len(seq) for seq in tokenized_seqs]) == min([len(seq) for seq in tokenized_seqs]) == set_seq_size
+            )
+
+            logger.info(f"Using seq len {set_seq_size}")
+
+            self.examples = []
+            for tokens in tokenized_seqs:
+                self.examples.append(torch.tensor(tokens))
+            
+            logger.info(f"Got {len(self.examples)} examples.")
+
+            start = time.time()
+            with open(cached_features_file, "wb") as handle:
+                pickle.dump(self.examples, handle, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(
+                f"Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start
+            )
 
 
 class Seq2SeqDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
@@ -393,6 +467,7 @@ class T5_VAE_Trainer(Trainer):
     ) -> float:
         input_ids = inputs['input_ids'].to(self.args.device)
 
+        import pdb; pdb.set_trace()
         decoder_ce, recon_loss, reg_loss = model(input_ids)
 
         reg_loss_w = self._regulariser_loss_weight_schedule()
@@ -723,10 +798,14 @@ class DataTrainingArguments:
     )
 
 
-def get_dataset(args: DataTrainingArguments, tokenizer: PreTrainedTokenizer, set_seq_size, local_rank=-1):
+def get_dataset(args: DataTrainingArguments, set_seq_size, tokenizer=None):
     file_path = args.train_data_file
+    if args.dataset == 'nes':
+        return NesDataset(
+            tokenizer=tokenizer, file_path=file_path, set_seq_size=set_seq_size, overwrite_cache=args.overwrite_cache
+        )
     return SetSizeLineByLineTextDataset(
-        tokenizer=tokenizer, file_path=file_path, set_seq_size=set_seq_size, overwrite_cache=args.overwrite_cache, local_rank=local_rank
+        tokenizer=tokenizer, file_path=file_path, set_seq_size=set_seq_size, overwrite_cache=args.overwrite_cache
     )
 
 
@@ -766,19 +845,31 @@ def _get_config(model_args):
         return CONFIG_MAPPING[model_args.model_type]()
 
 
-def _get_t5_model(t5_model_name, tokenizer_name=None, cache_dir=None):
-    # Load pretrained model and tokenizer
-    if tokenizer_name:
-        tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=cache_dir)
-    elif t5_model_name:
-        tokenizer = AutoTokenizer.from_pretrained(t5_model_name, cache_dir=cache_dir)
-    else:
-        raise ValueError(
-            "You are instantiating a new tokenizer from scratch. This is not supported, but you can do it from another script, save it,"
-            "and load it from here, using --tokenizer_name"
+def _get_t5_model(t5_model_name, set_seq_size, vocab_file=None, tokenizer_name=None, cache_dir=None, custom_tokenizer_name=None):
+    if custom_tokenizer_name:
+        if custom_tokenizer_name == 'nes':
+            tokenizer = NesT5Tokenizer(vocab_file)
+        else:
+            raise Exception(f'Did not recognise custom tokenizer {custom_tokenizer_name}')
+        config = T5Config(
+            vocab_size=len(tokenizer)
+            n_positions=set_seq_size,
+            pad_token_id=0,
+            eos_token_id=1,
         )
+    else:
+        # Load pretrained model and tokenizer
+        if tokenizer_name:
+            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=cache_dir)
+        elif t5_model_name:
+            tokenizer = AutoTokenizer.from_pretrained(t5_model_name, cache_dir=cache_dir)
+        else:
+            raise ValueError(
+                "You are instantiating a new tokenizer from scratch. This is not supported, but you can do it from another script, save it,"
+                "and load it from here, using --tokenizer_name"
+            )
+        config = AutoConfig.from_pretrained(t5_model_name, cache_dir=cache_dir)
 
-    config = AutoConfig.from_pretrained(t5_model_name, cache_dir=cache_dir)
     model = AutoModelForSeq2SeqLM.from_config(config)
     model.resize_token_embeddings(len(tokenizer))
 
@@ -792,7 +883,7 @@ def _get_ae(t5_model_config, model_args, training_args):
 
 def _get_t5_vae_requirements(model_args, training_args):
     config = _get_config(model_args)
-    t5_model, tokenizer = _get_t5_model(model_args.t5_model_name, model_args.tokenizer_name, model_args.cache_dir)
+    t5_model, tokenizer = _get_t5_model(model_args.t5_model_name, model_args.set_seq_size, model_args.tokenizer_name, model_args.cache_dir)
     vae = _get_ae(t5_model.config, model_args, training_args)
     return config, t5_model, tokenizer, vae
 
