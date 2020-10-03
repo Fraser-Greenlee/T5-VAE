@@ -65,16 +65,31 @@ class NesT5Tokenizer:
         tokens = list(filter(None, tokens))
         tokens = [txt.strip() for txt in tokens]
         tokens = list(set(tokens))
-        assert(len(tokens) > 10)
-        logger.info(f'Using {len(tokens)} tokens.')
-        self.vocab = ["<pad>", "</s>"] + tokens
+        assert len(tokens) > 10
+        logger.info(f"Using vocab size {len(tokens)}")
+        self.index2vocab = ["<pad>", "</s>"] + tokens
+        self.pad_token_id = 0
+        self.eos_token_id = 1
+        self.vocab2index = {word: i for i, word in enumerate(self.index2vocab)}
+        self.wait_amts = set()
+        for word in self.index2vocab:
+            if word[:2] == "WT":
+                self.wait_amts.add(int(word.split("_")[1]))
+
+    def get_index(self, word):
+        if word in self.vocab2index:
+            return self.vocab2index[word]
+        else:
+            assert word[:2] == "WT"
+            wait_amt = int(word.split("_")[1])
+            closest = min(self.wait_amts, key=lambda x: abs(x - wait_amt))
+            return self.vocab2index["WT_{}".format(closest)]
 
     def tokenize(self, txt):
-        txt = txt.split(" ")
-        return [self.vocab.index(word.strip()) for word in txt]
+        return [self.get_index(word) for word in txt.split(" ")]
 
     def __len__(self):
-        return len(self.vocab)
+        return len(self.index2vocab)
 
 
 class LatentEncoderLargeTanh_1kLatent(nn.Module):
@@ -248,6 +263,7 @@ class NesDataset(Dataset):
     Same as `LineByLineTextDataset` by Huggingface but modified to used fixed length sequences & to cache the result.
     Doesn't use an EOS token as we already know the sequence length and we're hoping to potentially blend larger sequences.
     """
+
     def __init__(self, tokenizer, file_path, set_seq_size, overwrite_cache=False):
         logger.info("Loading text.")
 
@@ -313,7 +329,7 @@ class Seq2SeqDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
     mlm: bool = False
 
     def __call__(self, examples: List[torch.Tensor]) -> Dict[str, torch.Tensor]:
-        input_ids = pad_sequence(examples, batch_first=True, padding_value=self.tokenizer.pad_token_id)
+        input_ids = pad_sequence(examples, batch_first=True)
         return {"input_ids": input_ids}
 
 
@@ -342,9 +358,6 @@ class T5_VAE_Trainer(Trainer):
         """
         Setup the optimizer and the learning rate scheduler, modified for when training with a VAE with an input-decoder.
         """
-        if self.optimizers is not None:
-            return self.optimizers
-
         parameters = list(self.model.named_parameters())
         no_decay = ["bias", "LayerNorm.weight"]
         optimizer_grouped_parameters = [
@@ -646,7 +659,8 @@ class ModelArguments:
         default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
     vocab_file: Optional[str] = field(
-        default=None, metadata={"help": "A vocab file with one token per line in a text file, used with the NES tokenizer."}
+        default=None,
+        metadata={"help": "A vocab file with one token per line in a text file, used with the NES tokenizer."},
     )
     cache_dir: Optional[str] = field(
         default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
@@ -671,9 +685,7 @@ class DataTrainingArguments:
 
 def get_dataset(args: DataTrainingArguments, set_seq_size, tokenizer):
     file_path = args.train_data_file
-    return NesDataset(
-        tokenizer, file_path, set_seq_size, args.overwrite_cache
-    )
+    return NesDataset(tokenizer, file_path, set_seq_size, args.overwrite_cache)
 
 
 def _log_load_failures(model, missing_keys, unexpected_keys, error_msgs):
@@ -696,15 +708,14 @@ def _get_ae_encoder_decoder(t5_model_config, model_args, training_args):
     return LatentEncoderLargeTanh_1kLatent(*args), LatentDecoderLargeT5NormFF(*(args + (t5_model_config,)))
 
 
-def _get_t5_model(
-    set_seq_size, vocab_file
-):
+def _get_t5_model(set_seq_size, vocab_file):
     tokenizer = NesT5Tokenizer(vocab_file)
     config = T5Config(
         vocab_size=len(tokenizer),
         n_positions=set_seq_size,
         pad_token_id=0,
         eos_token_id=1,
+        decoder_start_token_id=0,
     )
     model = AutoModelForSeq2SeqLM.from_config(config)
     model.resize_token_embeddings(len(tokenizer))
@@ -717,9 +728,7 @@ def _get_ae(t5_model_config, model_args, training_args):
 
 
 def _get_t5_vae_requirements(model_args, training_args):
-    t5_model, tokenizer = _get_t5_model(
-        model_args.set_seq_size, model_args.vocab_file
-    )
+    t5_model, tokenizer = _get_t5_model(model_args.set_seq_size, model_args.vocab_file)
     vae = _get_ae(t5_model.config, model_args, training_args)
     return t5_model, tokenizer, vae
 
