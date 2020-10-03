@@ -4,7 +4,7 @@ export TRAIN_FILE=nes_tx1_full_seq_size_300.txt
 # Use MODEL_PATH to load a previous run
 export MODEL_PATH=
 
-export MODEL_NAME=nes_just_language
+export MODEL_NAME=nes_just_language_250_epoch
 #export MODEL_PATH=python_state_changes
 export T5_MODEL_NAME=t5-base
 
@@ -25,5 +25,6 @@ python t5_vae.py \
     --overwrite_output_dir \
     --ae_latent_size 1000 \
     --set_seq_size 300 \
+    --num_train_epochs 250 \
 
 # needs an effective batch size >200 ?
