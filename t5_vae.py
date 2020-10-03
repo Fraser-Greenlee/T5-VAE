@@ -88,6 +88,10 @@ class NesT5Tokenizer:
     def tokenize(self, txt):
         return [self.get_index(word) for word in txt.split(" ")]
 
+    def decode(self, token_ids):
+        assert(len(token_ids.size()) == 1)
+        return ' '.join([self.index2vocab[index] for index in token_ids])
+
     def __len__(self):
         return len(self.index2vocab)
 
