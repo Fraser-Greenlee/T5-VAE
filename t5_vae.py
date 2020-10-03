@@ -37,14 +37,10 @@ from torch.utils.data.dataloader import DataLoader
 from unittest.mock import MagicMock
 
 from transformers import (
-    CONFIG_MAPPING,
     MODEL_WITH_LM_HEAD_MAPPING,
-    AutoConfig,
     AutoModelForSeq2SeqLM,
-    AutoTokenizer,
     DataCollatorForLanguageModeling,
     HfArgumentParser,
-    PreTrainedTokenizer,
     Trainer,
     TrainingArguments,
     set_seed,
@@ -245,94 +241,11 @@ class t5_AE(PreTrainedModel):
         return decoder_ce, recon_loss, reg_loss
 
 
-class SetSizeLineByLineTextDataset(Dataset):
+class NesDataset(Dataset):
     """
     Same as `LineByLineTextDataset` by Huggingface but modified to used fixed length sequences & to cache the result.
-    """
-
-    def __init__(self, tokenizer: PreTrainedTokenizer, file_path: str, set_seq_size, overwrite_cache=False):
-        logger.info("Loading text.")
-
-        directory, filename = os.path.split(file_path)
-        cached_features_file = os.path.join(
-            directory,
-            f"cached_set_size_line_by_line_{tokenizer.__class__.__name__}_set_seq_size_{set_seq_size}_{filename}",
-        )
-
-        if os.path.exists(cached_features_file) and not overwrite_cache:
-            start = time.time()
-            logger.info(f"Loading features from cached file {cached_features_file}...")
-            with open(cached_features_file, "rb") as handle:
-                self.examples = pickle.load(handle)
-            logger.info("[took %.3f s]", time.time() - start)
-
-        else:
-            if not os.path.isfile(file_path):
-                raise Exception(
-                    f"Can't find true file:\n{file_path}\nAlso can't find cahced file:\n{cached_features_file}"
-                )
-
-            logger.info(f"Creating features from dataset file at {directory}")
-
-            seq_texts = self._get_text_sequences(file_path)
-            random.shuffle(seq_texts)
-
-            tokenized_seqs = []
-            for text in tqdm(seq_texts, desc="Tokenizing each sequence."):
-                tokenized_seqs.append(tokenizer.convert_tokens_to_ids(tokenizer.tokenize(text)))
-
-            logger.info(f"Max sequence length in dataset: {max([len(seq)+1 for seq in tokenized_seqs])}")
-
-            pad_token = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-            skip_count = 0
-            self.examples = []
-            for tokens in tqdm(tokenized_seqs, desc="Making sequence labels."):
-                tokens.append(tokenizer.eos_token_id)
-                if len(tokens) > set_seq_size:
-                    skip_count += 1
-                    continue
-                input_tokens = self._pad_tokens(set_seq_size, torch.tensor(tokens), pad_token)
-                self.examples.append(tokenizer.build_inputs_with_special_tokens(input_tokens))
-
-            logger.info(f"Got {len(self.examples)} examples.")
-            logger.info(f"Skipped {skip_count} examples since they were too long.")
-
-            start = time.time()
-            with open(cached_features_file, "wb") as handle:
-                pickle.dump(self.examples, handle, protocol=pickle.HIGHEST_PROTOCOL)
-            logger.info("Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start)
-
-    @staticmethod
-    def _get_text_sequences(file_path):
-        with open(file_path, encoding="utf-8") as f:
-            seq_texts = f.read().split("\n")
-
-        # remove empty strings & strip
-        seq_texts = list(filter(None, seq_texts))
-        seq_texts = [txt.strip() for txt in seq_texts]
-
-        return seq_texts
-
-    @staticmethod
-    def _pad_tokens(set_size, tokens_tensor, pad_token):
-        padedd = torch.ones(set_size, dtype=torch.long) * pad_token
-        padedd[: tokens_tensor.size(0)] = tokens_tensor
-        return padedd
-
-    def __len__(self):
-        return len(self.examples)
-
-    def __getitem__(self, i):
-        return self.examples[i]
-
-
-class NesDataset(SetSizeLineByLineTextDataset):
-    """
-    Uses a vocab dict instead of a tokenizer since we don't want any fancy text processing.
-    Needs to have ALL sequences be of a set size.
     Doesn't use an EOS token as we already know the sequence length and we're hoping to potentially blend larger sequences.
     """
-
     def __init__(self, tokenizer, file_path, set_seq_size, overwrite_cache=False):
         logger.info("Loading text.")
 
@@ -377,6 +290,21 @@ class NesDataset(SetSizeLineByLineTextDataset):
             with open(cached_features_file, "wb") as handle:
                 pickle.dump(self.examples, handle, protocol=pickle.HIGHEST_PROTOCOL)
             logger.info("Saving features into cached file %s [took %.3f s]", cached_features_file, time.time() - start)
+
+    @staticmethod
+    def _get_text_sequences(file_path):
+        with open(file_path, encoding="utf-8") as f:
+            seq_texts = f.read().split("\n")
+        # remove empty strings & strip
+        seq_texts = list(filter(None, seq_texts))
+        seq_texts = [txt.strip() for txt in seq_texts]
+        return seq_texts
+
+    def __len__(self):
+        return len(self.examples)
+
+    def __getitem__(self, i):
+        return self.examples[i]
 
 
 class Seq2SeqDataCollatorForLanguageModeling(DataCollatorForLanguageModeling):
@@ -443,10 +371,6 @@ class T5_VAE_Trainer(Trainer):
 
     def _run_training_step(self, model: nn.Module, inputs: Dict[str, torch.Tensor], log=True) -> float:
         input_ids = inputs["input_ids"].to(self.args.device)
-
-        import pdb
-
-        pdb.set_trace()
         decoder_ce, recon_loss, reg_loss = model(input_ids)
 
         reg_loss_w = self._regulariser_loss_weight_schedule()
@@ -719,6 +643,9 @@ class ModelArguments:
     tokenizer_name: Optional[str] = field(
         default=None, metadata={"help": "Pretrained tokenizer name or path if not the same as model_name"}
     )
+    vocab_file: Optional[str] = field(
+        default=None, metadata={"help": "A vocab file with one token per line in a text file, used with the NES tokenizer."}
+    )
     cache_dir: Optional[str] = field(
         default=None, metadata={"help": "Where do you want to store the pretrained models downloaded from s3"}
     )
@@ -742,11 +669,7 @@ class DataTrainingArguments:
 
 def get_dataset(args: DataTrainingArguments, set_seq_size, tokenizer=None):
     file_path = args.train_data_file
-    if args.dataset == "nes":
-        return NesDataset(
-            tokenizer=tokenizer, file_path=file_path, set_seq_size=set_seq_size, overwrite_cache=args.overwrite_cache
-        )
-    return SetSizeLineByLineTextDataset(
+    return NesDataset(
         tokenizer=tokenizer, file_path=file_path, set_seq_size=set_seq_size, overwrite_cache=args.overwrite_cache
     )
 
@@ -771,46 +694,18 @@ def _get_ae_encoder_decoder(t5_model_config, model_args, training_args):
     return LatentEncoderLargeTanh_1kLatent(*args), LatentDecoderLargeT5NormFF(*(args + (t5_model_config,)))
 
 
-def _get_config(model_args):
-    if model_args.config_name:
-        return AutoConfig.from_pretrained(model_args.config_name, cache_dir=model_args.cache_dir)
-    elif model_args.model_path:
-        return AutoConfig.from_pretrained(model_args.model_path, cache_dir=model_args.cache_dir)
-    else:
-        logger.warning("You are instantiating a new config instance from scratch.")
-        return CONFIG_MAPPING[model_args.model_type]()
-
-
 def _get_t5_model(
-    t5_model_name, set_seq_size, vocab_file=None, tokenizer_name=None, cache_dir=None, custom_tokenizer_name=None
+    set_seq_size, vocab_file
 ):
-    if custom_tokenizer_name:
-        if custom_tokenizer_name == "nes":
-            tokenizer = NesT5Tokenizer(vocab_file)
-        else:
-            raise Exception(f"Did not recognise custom tokenizer {custom_tokenizer_name}")
-        config = T5Config(
-            vocab_size=len(tokenizer),
-            n_positions=set_seq_size,
-            pad_token_id=0,
-            eos_token_id=1,
-        )
-    else:
-        # Load pretrained model and tokenizer
-        if tokenizer_name:
-            tokenizer = AutoTokenizer.from_pretrained(tokenizer_name, cache_dir=cache_dir)
-        elif t5_model_name:
-            tokenizer = AutoTokenizer.from_pretrained(t5_model_name, cache_dir=cache_dir)
-        else:
-            raise ValueError(
-                "You are instantiating a new tokenizer from scratch. This is not supported, but you can do it from another script, save it,"
-                "and load it from here, using --tokenizer_name"
-            )
-        config = AutoConfig.from_pretrained(t5_model_name, cache_dir=cache_dir)
-
+    tokenizer = NesT5Tokenizer(vocab_file)
+    config = T5Config(
+        vocab_size=len(tokenizer),
+        n_positions=set_seq_size,
+        pad_token_id=0,
+        eos_token_id=1,
+    )
     model = AutoModelForSeq2SeqLM.from_config(config)
     model.resize_token_embeddings(len(tokenizer))
-
     return model, tokenizer
 
 
@@ -820,24 +715,23 @@ def _get_ae(t5_model_config, model_args, training_args):
 
 
 def _get_t5_vae_requirements(model_args, training_args):
-    config = _get_config(model_args)
     t5_model, tokenizer = _get_t5_model(
-        model_args.t5_model_name, model_args.set_seq_size, model_args.tokenizer_name, model_args.cache_dir
+        model_args.set_seq_size, model_args.vocab_file
     )
     vae = _get_ae(t5_model.config, model_args, training_args)
-    return config, t5_model, tokenizer, vae
+    return t5_model, tokenizer, vae
 
 
 def new_t5_vae(model_args, training_args):
-    config, t5_model, tokenizer, vae = _get_t5_vae_requirements(model_args, training_args)
-    return t5_AE(config, t5_model, vae, model_args.set_seq_size, tokenizer)
+    t5_model, tokenizer, vae = _get_t5_vae_requirements(model_args, training_args)
+    return t5_AE(t5_model.config, t5_model, vae, model_args.set_seq_size, tokenizer)
 
 
 def load_t5_vae(model_args, training_args):
-    config, t5_model, tokenizer, vae = _get_t5_vae_requirements(model_args, training_args)
+    t5_model, tokenizer, vae = _get_t5_vae_requirements(model_args, training_args)
     return t5_AE.from_pretrained(
         model_args.model_path,
-        config=config,
+        config=t5_model.config,
         t5_model=t5_model,
         vae=vae,
         set_seq_size=model_args.set_seq_size,
