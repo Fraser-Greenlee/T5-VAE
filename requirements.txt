@@ -1,4 +1,6 @@
-transformers==3.0.2
+transformers
 wandb
 tqdm
 torch
+flake8
+black

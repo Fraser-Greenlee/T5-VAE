@@ -4,3 +4,4 @@ wandb/*
 *.model
 *.pt
 *.bin
+venv
