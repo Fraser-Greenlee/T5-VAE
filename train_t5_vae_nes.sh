@@ -15,6 +15,7 @@ python t5_vae.py \
     --t5_model_name=$T5_MODEL_NAME \
     --do_train \
     --train_data_file=$TRAIN_FILE \
+    --vocab_file=nes_tx1_vocab.txt \
     --per_device_train_batch_size 10 \
     --gradient_accumulation_steps 5 \
     --save_total_limit 1 \

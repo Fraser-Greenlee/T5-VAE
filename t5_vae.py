@@ -65,6 +65,8 @@ class NesT5Tokenizer:
         tokens = list(filter(None, tokens))
         tokens = [txt.strip() for txt in tokens]
         tokens = list(set(tokens))
+        assert(len(tokens) > 10)
+        logger.info(f'Using {len(tokens)} tokens.')
         self.vocab = ["<pad>", "</s>"] + tokens
 
     def tokenize(self, txt):
@@ -667,10 +669,10 @@ class DataTrainingArguments:
     overwrite_cache: bool = field(default=False, metadata={"help": "Overwrite the cached training and evaluation sets"})
 
 
-def get_dataset(args: DataTrainingArguments, set_seq_size, tokenizer=None):
+def get_dataset(args: DataTrainingArguments, set_seq_size, tokenizer):
     file_path = args.train_data_file
     return NesDataset(
-        tokenizer=tokenizer, file_path=file_path, set_seq_size=set_seq_size, overwrite_cache=args.overwrite_cache
+        tokenizer, file_path, set_seq_size, args.overwrite_cache
     )
 
 
@@ -785,9 +787,8 @@ def main(alt_local_rank=None):
     train_dataset = (
         get_dataset(
             data_args,
-            tokenizer=model.tokenizer,
-            set_seq_size=model_args.set_seq_size,
-            local_rank=training_args.local_rank,
+            model_args.set_seq_size,
+            model.tokenizer,
         )
         if training_args.do_train
         else None
