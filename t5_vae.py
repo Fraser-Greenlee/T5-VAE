@@ -46,6 +46,9 @@ from transformers import (
     set_seed,
     T5Config,
 )
+from transformers.trainer_utils import (
+    TrainerState
+)
 from transformers.modeling_utils import PreTrainedModel
 from transformers.optimization import AdamW, get_linear_schedule_with_warmup
 from transformers.modeling_t5 import T5LayerFF
@@ -459,6 +462,36 @@ class T5_VAE_Trainer(Trainer):
 
         return data_loader
 
+    def create_optimizer_and_scheduler(self, num_training_steps: int):
+        """
+        Setup the optimizer and the learning rate scheduler.
+
+        We provide a reasonable default that works well. If you want to use something else, you can pass a tuple in the
+        Trainer's init through :obj:`optimizers`, or subclass and override this method in a subclass.
+        """
+        if self.optimizer is None:
+            no_decay = ["bias", "LayerNorm.weight"]
+            optimizer_grouped_parameters = [
+                {
+                    "params": [p for n, p in self.model.named_parameters() if not any(nd in n for nd in no_decay)],
+                    "weight_decay": self.args.weight_decay,
+                },
+                {
+                    "params": [p for n, p in self.model.named_parameters() if any(nd in n for nd in no_decay)],
+                    "weight_decay": 0.0,
+                },
+            ]
+            self.optimizer = AdamW(
+                optimizer_grouped_parameters,
+                lr=self.args.learning_rate,
+                betas=(self.args.adam_beta1, self.args.adam_beta2),
+                eps=self.args.adam_epsilon,
+            )
+        if self.lr_scheduler is None:
+            self.lr_scheduler = get_linear_schedule_with_warmup(
+                self.optimizer, num_warmup_steps=self.args.warmup_steps, num_training_steps=num_training_steps
+            )
+
     def train(self, model_path: Optional[str] = None):
         """
         Main training entry point.
@@ -483,6 +516,8 @@ class T5_VAE_Trainer(Trainer):
             num_train_epochs = self.args.num_train_epochs
 
         optimizer, scheduler = self.get_optimizers(num_training_steps=t_total)
+        self.create_optimizer_and_scheduler(num_training_steps=t_total)
+        self.state = TrainerState()
 
         # Check if saved optimizer or scheduler states exist
         if (
@@ -581,9 +616,6 @@ class T5_VAE_Trainer(Trainer):
 
                         if self.is_world_master():
                             self._log(logs)
-
-                        if self.args.evaluate_during_training:
-                            self.evaluate()
 
                     if self.args.save_steps > 0 and self.global_step % self.args.save_steps == 0:
                         # In all cases (even distributed/parallel), self.model is always a reference
